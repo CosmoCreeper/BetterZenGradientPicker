@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name           BetterZenGradientPicker
-// @version        1.7
+// @version        1.8
 // @description    A Sine mod which aims to overhaul Zen's gradient picker with tons of new features :))
 // @author         JustAdumbPrsn
 // @include        main
@@ -47,10 +47,9 @@ const ZenPickerMods = {
     this.log("Starting modules...");
 
     // 1. Unlock Total Dot Limit to 6
+    // NOTE: nsZenThemePicker is no longer a browser global in current Zen builds.
+    // MAX_DOTS must be set via the constructor reference only.
     try {
-      if (window.nsZenThemePicker) {
-        window.nsZenThemePicker.MAX_DOTS = 6;
-      }
       if (picker.constructor) {
         picker.constructor.MAX_DOTS = 6;
       }
@@ -58,7 +57,16 @@ const ZenPickerMods = {
       this.error("Failed to set MAX_DOTS", e);
     }
 
-    // 2. Initialize Modules
+    // 2. Install a safe `currentWorkspace` shim if Zen only exposes _currentWorkspace
+    if (!Object.getOwnPropertyDescriptor(Object.getPrototypeOf(picker), "currentWorkspace") &&
+        !Object.prototype.hasOwnProperty.call(picker, "currentWorkspace")) {
+      Object.defineProperty(picker, "currentWorkspace", {
+        get() { return this._currentWorkspace ?? null; },
+        configurable: true,
+      });
+    }
+
+    // 3. Initialize Modules
     for (const module of this.modules) {
       try {
         module.init(picker);
@@ -189,8 +197,6 @@ const ZenPickerMods = {
       let top = 0;
       const spacing = 8;
       toasts.forEach((toast) => {
-        // Use layout height (not transformed height) so spacing stays stable
-        // while scale/opacity animations are running.
         const height = Math.max(
           42,
           Math.round(toast.offsetHeight || toast.clientHeight || 42),
@@ -287,6 +293,52 @@ const ZenPickerMods = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// COMPATIBILITY HELPERS
+// ---------------------------------------------------------------------------
+
+/**
+ * Zen removed themedColors() and getSingleRGBColor() from nsZenThemePicker.
+ * This helper replicates what those methods used to return:
+ *   themedColors(colors) → colors with `c` arrays populated from dot positions
+ *   getSingleRGBColor(colorObj, forToolbar) → "rgba(r,g,b,opacity)" string
+ *
+ * We derive RGB directly from each color object's `c` field (already computed
+ * by Zen's pipeline and stored on the dot) or fall back to position-based math
+ * that mirrors getColorFromPosition().
+ */
+function _bzgpGetColorArray(colorObj) {
+  // If Zen already populated the rgb array, use it
+  if (colorObj?.c && Array.isArray(colorObj.c) && colorObj.c.length >= 3) {
+    return colorObj.c;
+  }
+  // Fallback: read from the dot element's CSS variable
+  if (colorObj?.element) {
+    const raw = colorObj.element.style.getPropertyValue("--zen-theme-picker-dot-color");
+    if (raw) {
+      const nums = raw.match(/\d+/g);
+      if (nums && nums.length >= 3) return nums.slice(0, 3).map(Number);
+    }
+  }
+  return [128, 128, 128]; // neutral grey if all else fails
+}
+
+/**
+ * Equivalent of the old getSingleRGBColor(colorObj, forToolbar).
+ * Returns an rgba() string applying the picker's current opacity.
+ */
+function _bzgpSingleRGBColor(colorObj, forToolbar, picker) {
+  if (colorObj?.isCustom) {
+    // Custom colours already carry their own CSS colour string in c
+    const c = colorObj.c;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) return `rgb(${c[0]},${c[1]},${c[2]})`;
+  }
+  const [r, g, b] = _bzgpGetColorArray(colorObj);
+  const opacity = picker?.currentOpacity ?? 0.5;
+  return `rgba(${r},${g},${b},${opacity})`;
+}
+
 /**
  * OpacityModule - Unlocks 0-1 opacity range
  */
@@ -340,6 +392,7 @@ class OpacityModule {
 
   patchPicker(picker) {
     const origOnWorkspaceChange = picker.onWorkspaceChange.bind(picker);
+    // blendWithWhiteOverlay may still exist; patching it is harmless either way
     picker.blendWithWhiteOverlay = (c, o) =>
       `rgba(${c[0]},${c[1]},${c[2]},${o})`;
     picker.onWorkspaceChange = (ws, skip, theme) => {
@@ -504,7 +557,6 @@ class HarmonyModule {
                 animation: zen-dot-angular-wiggle 0.6s cubic-bezier(0.4, 0, 0.2, 1) both !important;
                 z-index: 2001 !important;
             }
-
         `;
   }
 
@@ -545,14 +597,12 @@ class HarmonyModule {
     const origCalculate = picker.calculateCompliments.bind(picker);
     const origHandle = picker.handleColorPositions.bind(picker);
 
-    // 1. Cleanup Orphans - Fixes "Dead Dots" by ensuring state and UI never diverge
+    // 1. Cleanup Orphans
     picker.handleColorPositions = function (
       colorPositions,
       ignoreLegacy = false,
     ) {
       const targetIDs = new Set(colorPositions.map((p) => p.ID));
-
-      // Immediately purge any dots that the harmony calculation decided should not exist
       this.dots = this.dots.filter((dot) => {
         if (!targetIDs.has(dot.ID)) {
           dot.element?.remove();
@@ -560,12 +610,10 @@ class HarmonyModule {
         }
         return true;
       });
-
-      // Call original handle logic for movement/color updates
       return origHandle(colorPositions, ignoreLegacy);
     };
 
-    // 2. Count-Aware Calculation - Fixes "Mode Jumping" and "5-dot jump"
+    // 2. Count-Aware Calculation
     picker.calculateCompliments = function (
       dots,
       action = "update",
@@ -574,11 +622,9 @@ class HarmonyModule {
       const currentAlgo = useHarmony || this.useAlgo || "";
       const harmonies = this.colorHarmonies;
 
-      // Robust Count Logic: dots.length is already reduced for "remove" in native calls
       const totalTargetDots = dots.length + (action === "add" ? 1 : 0);
       const targetAnglesCount = Math.max(0, totalTargetDots - 1);
 
-      // Direct Default Lookup during Transitions (Zen Default Behavior)
       if (action === "add" || action === "remove") {
         const nextHarmony = harmonies.find(
           (h) => h.angles.length === targetAnglesCount,
@@ -606,7 +652,6 @@ class HarmonyModule {
           return updatedDots;
         }
 
-        // For standard harmonies, let the original logic handle the default snap by passing ""
         return origCalculate(dots, action, "");
       }
 
@@ -781,7 +826,6 @@ class HarmonyModule {
 
 /**
  * RotationModule - Custom Gradient Rotation Control
- * Forced isolation per workspace via about:config
  */
 class RotationModule {
   static DEFAULT_ROTATION = -45;
@@ -820,7 +864,6 @@ class RotationModule {
     this.patchPanelOpen(picker);
     picker._rotationModPatched = true;
 
-    // Apply saved rotation to the initial workspace on startup
     setTimeout(() => {
       if (this.dialWrapper) {
         this.restoreRotation();
@@ -864,7 +907,6 @@ class RotationModule {
             #zen-rotation-dial-wrapper[disabled] #zen-rotation-dial-handler { pointer-events: none !important; cursor: default; }
             #zen-rotation-dial-handler:hover { height: 14px; }
 
-            /* Texture Wrapper Reset */
             #PanelUI-zen-gradient-generator-texture-wrapper { position: relative; cursor: default; }
             #PanelUI-zen-gradient-generator-texture-wrapper.knob-hover { cursor: pointer; }
             #zen-grain-reset-label { 
@@ -924,7 +966,6 @@ class RotationModule {
     this.dialHandler = container;
     this._dialHandleEl = handler;
 
-    // Create or get secondary row for our custom controls
     let secondaryRow = document.getElementById("zen-picker-secondary-row");
     if (!secondaryRow) {
       const nativeRow = document.getElementById(
@@ -937,10 +978,8 @@ class RotationModule {
       nativeRow.parentNode.insertBefore(secondaryRow, nativeRow.nextSibling);
     }
 
-    // Create wrapper for rotation dial (right side of secondary row)
     const rotationWrapper = document.createElement("vbox");
     rotationWrapper.id = "zen-picker-rotation-wrapper";
-    // User requested 20px left shift
     rotationWrapper.style.marginRight = "20px";
     rotationWrapper.appendChild(wrapper);
 
@@ -985,10 +1024,8 @@ class RotationModule {
       }
     });
 
-    // Knob hover detection for reload icon
     wrapper.addEventListener("mousemove", (e) => {
       if (wrapper.hasAttribute("disabled") || this._isDragging) return;
-
       const rect = wrapper.getBoundingClientRect();
       const dx = e.clientX - (rect.left + rect.width / 2);
       const dy = e.clientY - (rect.top + rect.height / 2);
@@ -1078,8 +1115,6 @@ class RotationModule {
       this.updateUI();
       this._ignoreNextThemeUpdate = true;
       try {
-        // BUG FIX: passing true here suppresses the "deep refresh" (preference change logic)
-        // which was causing the infinite dot flickering during rotation.
         this.picker.updateCurrentWorkspace(true);
       } finally {
         this._ignoreNextThemeUpdate = false;
@@ -1116,7 +1151,6 @@ class RotationModule {
     }
     this._ignoreNextThemeUpdate = true;
     try {
-      // Only update visuals, don't trigger full refresh
       if (this.picker.updateCurrentWorkspace)
         this.picker.updateCurrentWorkspace(false);
     } finally {
@@ -1155,7 +1189,6 @@ class RotationModule {
         this._ignoreNextThemeUpdate = true;
         const ws = this.activeWorkspace;
         if (ws?.theme) ws.theme.rotation = this.currentRotation;
-        // Avoid full updateCurrentWorkspace call which triggers redundant refreshes
         this._ignoreNextThemeUpdate = false;
       });
     }
@@ -1179,7 +1212,6 @@ class RotationModule {
     const origOnWorkspace = picker.onWorkspaceChange.bind(picker);
     picker.onWorkspaceChange = function (ws, skip, theme) {
       if (!self._ignoreNextThemeUpdate) self.restoreRotation(ws);
-
       origOnWorkspace(ws, skip, theme);
       self.updateUI();
     };
@@ -1197,40 +1229,55 @@ class RotationModule {
     };
   }
 
+  /**
+   * FIX: Zen removed themedColors() and getSingleRGBColor() from nsZenThemePicker.
+   *
+   * Old code relied on:
+   *   const themedColors = this.themedColors(colors);
+   *   const cols = themedColors.map(c => this.getSingleRGBColor(c, forToolbar));
+   *
+   * We now derive the same information directly from picker.dots (which always
+   * carry pre-computed `c` arrays) and apply opacity manually.
+   */
   patchGradient(picker) {
     const self = this;
     const orig = picker.getGradient.bind(picker);
 
     picker.getGradient = function (colors, forToolbar = false) {
-      // 1. Force native state restoration (lightness/algorithm) by calling original function
+      // Always call original first so Zen's internal state (lightness,
+      // algorithm, CSS vars) stays up-to-date.
       const nativeResult = orig(colors, forToolbar);
 
-      const themedColors = this.themedColors(colors);
-      // 2. Synchronize algorithm state
+      // ── Sync algorithm state ──────────────────────────────────────────────
+      // `colors` is the gradientColors array passed by Zen's pipeline.
+      // Each entry may carry an `algorithm` field written by native code.
       const themeAlgo =
-        themedColors.length > 1 ? (themedColors[0]?.algorithm ?? "") : "";
+        colors?.length > 1 ? (colors[0]?.algorithm ?? "") : "";
       if (themeAlgo) {
         this.useAlgo = themeAlgo;
-        // BUG FIX: Sync zen-harmony-mode attribute so floating dots get pointer-events
         if (themeAlgo === "floating") {
-          this.panel.setAttribute("zen-harmony-mode", "floating");
+          this.panel?.setAttribute("zen-harmony-mode", "floating");
           this._floatingActive = true;
         }
       }
 
+      // ── Rotation skip guard ───────────────────────────────────────────────
       const uuid = this._currentWorkspace?.uuid;
-      let rotation = self.currentRotation;
       const stored = ZenPickerMods.Storage.getRotation(uuid);
-      if (stored !== undefined) rotation = stored;
-
-      // 3. If only 1 dot, native result is sufficient
-      if (themedColors.length <= 1) return nativeResult;
-
+      const rotation = stored !== undefined ? stored : self.currentRotation;
       const displayDelta = self.displayAngle;
-      const getCol = (c) => this.getSingleRGBColor(c, forToolbar);
-      const cols = themedColors.map(getCol);
 
-      if (themedColors.find((c) => c.isCustom)) {
+      // Only 1 dot → no rotation math needed; return native result.
+      if (!colors || colors.length <= 1) return nativeResult;
+
+      // ── Build colour strings from dot data ────────────────────────────────
+      // We use the compat helper instead of the removed themedColors() /
+      // getSingleRGBColor() methods.
+      const getCol = (c) => _bzgpSingleRGBColor(c, forToolbar, this);
+      const cols = colors.map(getCol);
+
+      // Custom colours: simple linear with rotation applied.
+      if (colors.find((c) => c.isCustom)) {
         const stops = cols
           .map((c, i) => `${c} ${(i / (cols.length - 1)) * 100}%`)
           .join(", ");
@@ -1259,7 +1306,7 @@ class RotationModule {
         return `linear-gradient(${angle}deg, ${cols[1]} 0%, ${cols[0]} 100%)`;
       }
 
-      // 3 Dots (Pure Native)
+      // 3 Dots
       const baseAngle = -5 + displayDelta;
       if (cols.length === 3) {
         return [
@@ -1269,46 +1316,42 @@ class RotationModule {
         ].join(", ");
       }
 
-      // 4+ Dots Special Polish
+      // 4+ Dots
       const layers = [];
       const r60 = "60%";
 
-      // 1. TOP LAYERS: Radial glows that must be distinct (Bottom segments)
       if (cols.length === 4) {
         layers.push(
           `radial-gradient(circle at ${rot(0, 100)}, ${cols[2]} 0%, transparent ${r60})`,
-        ); // BL (Dot 3)
+        );
       } else if (cols.length === 5) {
         layers.push(
           `radial-gradient(circle at ${rot(0, 100)}, ${cols[2]} 0%, transparent ${r60})`,
-        ); // BL (Dot 3)
+        );
         layers.push(
           `radial-gradient(circle at ${rot(100, 100)}, ${cols[3]} 0%, transparent ${r60})`,
-        ); // BR (Dot 4)
+        );
       } else if (cols.length === 6) {
         layers.push(
           `radial-gradient(circle at ${rot(0, 100)}, ${cols[2]} 0%, transparent ${r60})`,
-        ); // BL (Dot 3)
+        );
         layers.push(
           `radial-gradient(circle at ${rot(100, 100)}, ${cols[4]} 0%, transparent ${r60})`,
-        ); // BR (Dot 5)
+        );
         layers.push(
           `radial-gradient(circle at ${rot(50, 100)}, ${cols[3]} 0%, transparent 65%)`,
-        ); // BC (Dot 4)
+        );
       }
 
-      // 2. MIDDLE LAYER: The Linear Background wash
       layers.push(
         `linear-gradient(${baseAngle}deg, ${cols[cols.length - 1]} 10%, transparent 80%)`,
       );
-
-      // 3. UNDER LAYERS: Primary top glows (shine through linear transparency)
       layers.push(
         `radial-gradient(circle at ${rot(95, 0)}, ${cols[1]} 0%, transparent ${r60})`,
-      ); // TR (Dot 2)
+      );
       layers.push(
         `radial-gradient(circle at ${rot(0, 0)}, ${cols[0]} 10%, transparent ${r60})`,
-      ); // TL (Dot 1)
+      );
 
       return layers.join(", ");
     };
@@ -1350,7 +1393,7 @@ class PaletteModule {
   init(picker) {
     if (picker._paletteModPatched) return;
     this.picker = picker;
-    this._selectedMode = null; // Forces mode when set
+    this._selectedMode = null;
     this.injectUI();
     this.injectSlider();
     this.patchPicker(picker);
@@ -1474,7 +1517,7 @@ class PaletteModule {
                 z-index: 5;
                 padding: 0 5px;
                 transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-                opacity: 0.6; /* Increased base visibility */
+                opacity: 0.6;
             }
             #zen-picker-lightness-slider.zen-programmatic-change::-moz-range-thumb {
                 transition: none !important;
@@ -1500,12 +1543,11 @@ class PaletteModule {
                 transition: height 0.2s ease-out, width 0.2s ease-out;
             }
             #zen-picker-lightness-wrapper.zen-programmatic-change #zen-picker-lightness-slider::-moz-range-thumb {
-                /* Thumb position is handled by browser, but we can animate size */
                 transition: height 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             }
             #zen-picker-lightness-slider::-moz-range-track {
                 border-radius: 999px;
-                height: 18px; /* Match native track */
+                height: 18px;
                 background: transparent;
             }
             #zen-picker-lightness-slider::-moz-range-progress {
@@ -1517,7 +1559,6 @@ class PaletteModule {
             #zen-picker-lightness-slider[disabled]::-moz-range-thumb {
                 visibility: hidden;
             }
-            /* SVG line styling - EXACT MATCH to native opacity slider */
             #zen-picker-lightness-wave {
                 position: absolute;
                 left: -5px;
@@ -1555,7 +1596,6 @@ class PaletteModule {
             #zen-picker-lightness-wrapper[disabled="true"] #zen-picker-lightness-path {
                 stroke: light-dark(rgba(77, 77, 77, 0.5), rgba(161, 161, 161, 0.5)) !important;
             }
-            /* Secondary Row - matches native #PanelUI-zen-gradient-colors-wrapper */
             #zen-picker-secondary-row {
                 display: flex;
                 justify-content: space-between;
@@ -1565,7 +1605,6 @@ class PaletteModule {
                 gap: 1.5rem;
                 padding: 0 var(--panel-padding, 10px);
             }
-            /* Rotation wrapper in secondary row - match native layout */
             #zen-picker-rotation-wrapper {
                 display: flex;
                 align-items: center;
@@ -1575,7 +1614,6 @@ class PaletteModule {
                 z-index: 20;
                 transition: opacity 0.2s;
             }
-            /* Controls layout */
             #PanelUI-zen-gradient-generator-controls {
                 flex-direction: column !important;
                 align-items: stretch !important;    
@@ -1590,13 +1628,10 @@ class PaletteModule {
     if (!self._lastWorkspaceId) {
       self._lastWorkspaceId = gZenWorkspaces?.activeWorkspace?.uuid || null;
     }
-    // Capture original for forceNativeLightness
     this.origGetColor = picker.getColorFromPosition.bind(picker);
 
-    // 1. Authoritative Update & Sync
     const origUpdate = picker.updateCurrentWorkspace.bind(picker);
     picker.updateCurrentWorkspace = function (skipSave = true) {
-      // A. Detect workspace change and reset palette override
       const currentWsId = gZenWorkspaces?.activeWorkspace?.uuid;
       const isWsChange =
         currentWsId &&
@@ -1606,8 +1641,6 @@ class PaletteModule {
         self._selectedMode = null;
       }
 
-      // B. Default back to Full if no dots (User request)
-      // Shielded: Don't reset during restoration transitions
       if (
         this.dots.length === 0 &&
         self._selectedMode &&
@@ -1616,18 +1649,13 @@ class PaletteModule {
         self._selectedMode = null;
       }
 
-      // C. Capture the native logic's result first (sets up the base state)
       const res = origUpdate.apply(this, [skipSave]);
 
-      // D. Refresh our own tool UI (Heart/Palette icons)
-      // Trigger animation if: Workspace changed OR Lightness changed substantially OR manual save
       const newL = this.dots[0]?.lightness ?? 50;
       const lightnessChanged =
         Math.abs((self._lastSyncedLightness ?? 50) - newL) > 0.5;
       const rotationInProg = picker._rotationModule?._isDragging;
 
-      // If lightness changed from an external source (preset/favorite), reset our override mode
-      // We ignore changes triggered by our own palette cycle via _internalUpdate
       if (lightnessChanged && !rotationInProg && !self._internalUpdate) {
         self._selectedMode = null;
       }
@@ -1644,9 +1672,7 @@ class PaletteModule {
 
       return res;
     };
-    // 2. Clear stale forced palette before workspace reconstruction.
-    // Without this, a forced mode from workspace A (especially B&W)
-    // can leak into workspace B during native color rebuilding.
+
     const origOnWsChange = picker.onWorkspaceChange.bind(picker);
     picker.onWorkspaceChange = function (...args) {
       const incomingWsId =
@@ -1663,23 +1689,16 @@ class PaletteModule {
       }
       return res;
     };
-    // 3. Keep native type handling for position->color math.
-    // For full palettes, type is intentionally undefined; forcing it from a stale
-    // selected mode can collapse colors to grayscale on workspace-switch inversion.
+
     const origGetColor = picker.getColorFromPosition.bind(picker);
     picker.getColorFromPosition = function (x, y, type) {
       return origGetColor(x, y, type);
     };
 
-    // 4. Authoritative Background: Force mode during background generation
     const origGetGradient = picker.getGradient.bind(picker);
     picker.getGradient = function (colors, forToolbar = false) {
       if (self._selectedMode && colors.length > 0) {
         const mode = self._selectedMode;
-        // Only override type/lightness for scalar modes (explicit-lightness).
-        // Per-dot palettes (Full/B&W) already have correct RGB from position
-        // calculations - stamping a single lightness on all dots would destroy
-        // their per-dot color variation and produce solid white/black.
         if (mode.type === "explicit-lightness") {
           const currentAlgo = this.useAlgo || "";
           colors.forEach((c) => {
@@ -1694,16 +1713,12 @@ class PaletteModule {
       return origGetGradient(colors, forToolbar);
     };
 
-    // 4. Release override if user clicks a native preset box
     document
       .getElementById("PanelUI-zen-gradient-generator-color-pages")
       ?.addEventListener(
         "click",
         (e) => {
-          // Ignore if it's our own favorite box
           if (e.target.classList.contains("zen-picker-favorite-box")) return;
-
-          // Only target native Zen palette preset boxes
           if (e.target.classList.contains("zen-theme-picker-box")) {
             self._selectedMode = null;
             self.updateUI();
@@ -1723,7 +1738,6 @@ class PaletteModule {
       if (!panel) return;
 
       const rect = panel.getBoundingClientRect();
-      // Constants matched to Zen's native logic
       const padding = 30;
       const width = rect.width + padding * 2;
       const height = rect.height + padding * 2;
@@ -1731,15 +1745,12 @@ class PaletteModule {
       const centerX = width / 2;
       const centerY = height / 2;
 
-      // Corrected Formula: Lightness = (dist / radius) * 100
-      // Distance = (Lightness / 100) * radius
       const dist = radius * (lightness / 100);
 
-      // Calculate x, y relative to center, then adjust for dotHalfSize(29)
+      // dotHalfSize = 29 (verified in current Zen source)
       const x = centerX + dist - 29;
       const y = centerY - 29;
 
-      // Call original to trigger side-effect update of #currentLightness
       this.origGetColor(x, y, "force-update");
     } catch (e) {
       console.error("Force Lightness Error", e);
@@ -1754,7 +1765,6 @@ class PaletteModule {
     }
 
     const firstDot = this.picker.dots[0];
-    // If no dots (restoring from 0 dots), look at the theme's lightness
     const type = firstDot
       ? firstDot.type
       : this.picker.currentWorkspace?.theme?.gradientColors?.[0]?.type;
@@ -1764,12 +1774,12 @@ class PaletteModule {
 
     if (type === "explicit-black-white") return 5;
     if (type === "explicit-lightness") {
-      if (lightness >= 80) return 1; // Pastel
-      if (lightness <= 20) return 4; // Deep Dark
-      if (lightness <= 45) return 3; // Dark
-      return 2; // Vibrant
+      if (lightness >= 80) return 1;
+      if (lightness <= 20) return 4;
+      if (lightness <= 45) return 3;
+      return 2;
     }
-    return 0; // Full
+    return 0;
   }
 
   cyclePalette() {
@@ -1851,7 +1861,6 @@ class PaletteModule {
       return;
     }
 
-    // Fallback if Favorites module is unavailable.
     this._internalUpdate = true;
     try {
       this._selectedMode = mode.type === undefined ? null : mode;
@@ -1894,11 +1903,11 @@ class PaletteModule {
 
   _pickRandomMode() {
     const modes = [
-      { mode: PaletteModule.MODES[0], weight: 3.4 }, // full
-      { mode: PaletteModule.MODES[2], weight: 3.2 }, // vibrant
-      { mode: PaletteModule.MODES[1], weight: 2.2 }, // pastel
-      { mode: PaletteModule.MODES[3], weight: 1.3 }, // dark
-      { mode: PaletteModule.MODES[4], weight: 0.9 }, // deep dark
+      { mode: PaletteModule.MODES[0], weight: 3.4 },
+      { mode: PaletteModule.MODES[2], weight: 3.2 },
+      { mode: PaletteModule.MODES[1], weight: 2.2 },
+      { mode: PaletteModule.MODES[3], weight: 1.3 },
+      { mode: PaletteModule.MODES[4], weight: 0.9 },
     ];
     const picked = this._pickWeighted(modes) || PaletteModule.MODES[2];
     const mode = { ...picked };
@@ -1921,8 +1930,6 @@ class PaletteModule {
   }
 
   _randomTexture() {
-    // Native texture control uses 16 fixed steps: 0, 1/16, ..., 15/16.
-    // Strong bias toward lower grain and mostly within steps 0..9.
     const weightedSteps = [
       { mode: 0, weight: 18 },
       { mode: 1, weight: 15 },
@@ -1946,7 +1953,6 @@ class PaletteModule {
   }
 
   _pickRotation() {
-    // Usually keep rotation at 0, otherwise prefer smaller offsets.
     const weightedAngles = [
       { mode: 0, weight: 30 },
       { mode: 15, weight: 4.2 },
@@ -2013,7 +2019,6 @@ class PaletteModule {
     if (this.picker.dots.length) {
       this._internalUpdate = true;
       try {
-        // Correctly update local dots array avoid stale reads in updateUI/hooks
         this.picker.dots.forEach((d) => {
           if (mode.lightness !== undefined) d.lightness = mode.lightness;
           d.type = mode.type;
@@ -2051,25 +2056,20 @@ class PaletteModule {
       `Palette: ${mode.label}${this._selectedMode ? " (Forced)" : ""}`,
     );
 
-    // Sync Lightness Slider
     const slider = document.getElementById("zen-picker-lightness-slider");
     const sliderWrapper = document.getElementById(
       "zen-picker-lightness-wrapper",
     );
 
     if (slider) {
-      // Disable slider if: No Dots OR Full Mode OR B&W Mode
       const isExplicit = mode.type === "explicit-lightness";
       const isDisabled = dotCount === 0 || !isExplicit;
 
       slider.disabled = isDisabled;
-      // Native opacity slider disabled style handling
       sliderWrapper?.setAttribute("disabled", isDisabled);
-      slider.style.opacity = "1"; // Keep visible as requested
+      slider.style.opacity = "1";
 
-      // Only update slider value if we are in an explicit mode
       if (isExplicit) {
-        // Restoration Fix: Priority = Theme > Dot > 50
         const currentL =
           this._selectedMode?.lightness ??
           this.picker.currentWorkspace?.theme?.lightness ??
@@ -2092,14 +2092,12 @@ class PaletteModule {
           this.updateLightnessVisuals(currentL);
         }
       } else {
-        // Update wave visual state even when disabled (e.g. 0% for B&W)
         const l = mode.type === "explicit-black-white" ? 0 : 50;
         this.updateLightnessVisuals(l);
       }
     }
   }
 
-  // Helper to parse SVG path commands for interpolation
   parseSinePath(pathStr) {
     const points = [];
     const commands = pathStr.match(/[MCL]\s*[\d\s.\-,]+/g);
@@ -2138,7 +2136,6 @@ class PaletteModule {
   }
 
   interpolateWavePath(progress) {
-    // Native Zen paths (Exact match: 367.037 length)
     const linePath = `M 51.373 27.395 L 367.037 27.395`;
     const sinePath = `M 51.373 27.395 C 60.14 -8.503 68.906 -8.503 77.671 27.395 C 86.438 63.293 95.205 63.293 103.971 27.395 C 112.738 -8.503 121.504 -8.503 130.271 27.395 C 139.037 63.293 147.803 63.293 156.57 27.395 C 165.335 -8.503 174.101 -8.503 182.868 27.395 C 191.634 63.293 200.4 63.293 209.167 27.395 C 217.933 -8.503 226.7 -8.503 235.467 27.395 C 244.233 63.293 252.999 63.293 261.765 27.395 C 270.531 -8.503 279.297 -8.503 288.064 27.395 C 296.83 63.293 305.596 63.293 314.363 27.395 C 323.13 -8.503 331.896 -8.503 340.662 27.395 M 314.438 27.395 C 323.204 -8.503 331.97 -8.503 340.737 27.395 C 349.503 63.293 358.27 63.293 367.037 27.395`;
 
@@ -2178,7 +2175,6 @@ class PaletteModule {
   injectSlider() {
     if (document.getElementById("zen-picker-lightness-wrapper")) return;
 
-    // Create or get secondary row for our custom controls
     let secondaryRow = document.getElementById("zen-picker-secondary-row");
     if (!secondaryRow) {
       const nativeRow = document.getElementById(
@@ -2191,19 +2187,16 @@ class PaletteModule {
       nativeRow.parentNode.insertBefore(secondaryRow, nativeRow.nextSibling);
     }
 
-    // Create our new Lightness Slider Wrapper (left side of secondary row)
     const sliderContainer = document.createElement("vbox");
     sliderContainer.id = "zen-picker-lightness-wrapper";
     sliderContainer.setAttribute("flex", "1");
     sliderContainer.setAttribute("align", "stretch");
 
-    // 1. The Wave Box
     const waveBox = document.createElement("hbox");
     waveBox.id = "zen-picker-lightness-wave";
     waveBox.setAttribute("flex", "1");
     waveBox.style.pointerEvents = "none";
 
-    // Unique IDs for gradient to prevent conflicts
     const gradientId = "zen-picker-lightness-generator-gradient";
     const stop1Id = "zen-picker-lightness-stop-1";
     const stop2Id = "zen-picker-lightness-stop-2";
@@ -2227,38 +2220,29 @@ class PaletteModule {
             </svg>
         `;
 
-    // 2. The Input
     const slider = document.createElement("input");
     slider.type = "range";
     slider.id = "zen-picker-lightness-slider";
     slider.min = "5";
     slider.max = "95";
-    slider.step = "any"; // Fixes bounce/snapping during JS animations
+    slider.step = "any";
     slider.value = "50";
     slider.setAttribute("flex", "1");
 
-    let lastRun = 0;
-    const limit = 50;
+    this.updateLightnessVisuals(50);
 
-    // Initial update
-    this.updateLightnessVisuals(50); // Start at mid
-
-    // High performance local update while dragging
     slider.addEventListener("input", (e) => {
-      let val = parseFloat(e.target.value); // Use parseFloat for "any" step
+      let val = parseFloat(e.target.value);
 
-      // Enforce Lightness Inversion if enabled
       if (ZenPickerMods.modules) {
         const dynamicMod = ZenPickerMods.modules.find(
           (m) => m instanceof DynamicThemeModule,
         );
         if (dynamicMod && dynamicMod._inversionEnabled) {
           const isDark = this.picker.isDarkMode;
-          // Dark theme requires dark gradients (val <= 50). Light theme requires light gradients (val >= 50)
           if (isDark && val > 50) val = 50;
           else if (!isDark && val < 50) val = 50;
 
-          // Update slider visually to the constrained value
           if (val !== parseFloat(e.target.value)) {
             e.target.value = val;
           }
@@ -2278,10 +2262,8 @@ class PaletteModule {
         baseMode = PaletteModule.MODES.find((m) => m.id === "vibrant");
       }
 
-      // Update current forced state object
       this._selectedMode = { ...baseMode, lightness: val };
 
-      // 1. PROJECT: Direct Dot & Background projection (Fast)
       if (this.picker.dots.length) {
         this._internalUpdate = true;
         try {
@@ -2294,11 +2276,9 @@ class PaletteModule {
       }
     });
 
-    // Heavy Sync only on release (change)
     slider.addEventListener("change", (e) => {
       let val = parseFloat(e.target.value);
 
-      // Enforce Lightness Inversion if enabled
       if (ZenPickerMods.modules) {
         const dynamicMod = ZenPickerMods.modules.find(
           (m) => m instanceof DynamicThemeModule,
@@ -2314,14 +2294,17 @@ class PaletteModule {
         }
       }
 
-      this._internalUpdate = true; // Prevent mode reset during sync
+      // NOTE: `mode` is intentionally re-read here to get the freshest selected mode
+      const mode = this._selectedMode || PaletteModule.MODES[this.getCurrentModeIndex()];
+
+      this._internalUpdate = true;
       try {
         this.forceNativeLightness(val);
 
         const positions = this.picker.dots.map((d) => ({
           ID: d.ID,
           position: d.position,
-          type: mode.type,
+          type: mode?.type,
         }));
         this.picker.handleColorPositions(positions, true);
         this.picker.updateCurrentWorkspace(false);
@@ -2334,9 +2317,9 @@ class PaletteModule {
     sliderContainer.appendChild(waveBox);
     sliderContainer.appendChild(slider);
 
-    // Prepend to secondary row (left side)
     secondaryRow.insertBefore(sliderContainer, secondaryRow.firstChild);
   }
+
   animateSliderValue(slider, target) {
     if (this._isAnimating) {
       if (this._rafId) cancelAnimationFrame(this._rafId);
@@ -2344,7 +2327,6 @@ class PaletteModule {
     }
     const start = parseFloat(slider.value);
     if (Math.abs(start - target) < 0.5) {
-      // Threshold to prevent animation for tiny changes
       slider.value = target;
       this.updateLightnessVisuals(target);
       slider.setAttribute("tooltiptext", `Lightness: ${Math.round(target)}%`);
@@ -2358,14 +2340,12 @@ class PaletteModule {
     const step = (timestamp) => {
       if (!startTimestamp) startTimestamp = timestamp;
       const progress = Math.min((timestamp - startTimestamp) / duration, 1);
-      // Ease out cubic
       const ease = 1 - Math.pow(1 - progress, 3);
       const current = start + (target - start) * ease;
 
       slider.classList.add("zen-programmatic-change");
       slider.value = current;
       this.updateLightnessVisuals(current);
-      // RESIZE DURING SLIDE: Update thumb size in the loop
       const opacity = (current - 5) / 90;
       slider.style.setProperty("--zen-thumb-height", `${40 + opacity * 15}px`);
       slider.style.setProperty("--zen-thumb-width", `${10 + opacity * 15}px`);
@@ -2373,13 +2353,12 @@ class PaletteModule {
       if (progress < 1) {
         this._rafId = requestAnimationFrame(step);
       } else {
-        slider.value = target; // Final snap to target
+        slider.value = target;
         this.updateLightnessVisuals(target);
         this._isAnimating = false;
         this._rafId = null;
         slider.classList.remove("zen-programmatic-change");
         slider.setAttribute("tooltiptext", `Lightness: ${Math.round(target)}%`);
-        // Final sized sync
         const finalOpacity = (target - 5) / 90;
         slider.style.setProperty(
           "--zen-thumb-height",
@@ -2401,7 +2380,6 @@ class PaletteModule {
     const slider = document.getElementById("zen-picker-lightness-slider");
     if (!slider) return;
 
-    // Normalized 0-1
     const opacity = (val - 5) / 90;
 
     const svgPath = document.getElementById("zen-picker-lightness-path");
@@ -2411,8 +2389,6 @@ class PaletteModule {
       const d = this.interpolateWavePath(opacity);
       svgPath.setAttribute("d", d);
 
-      // Native stop syncing
-      // Native dual-stop syncing for progress fill
       const stop2 = document.getElementById("zen-picker-lightness-stop-2");
       const stop3 = document.getElementById("zen-picker-lightness-stop-3");
       const fillPct = `${Math.max(0, Math.min(100, opacity * 100))}%`;
@@ -2427,26 +2403,18 @@ class PaletteModule {
         svgPath.style.stroke = `url(#${gradientId})`;
       }
 
-      // Sync overall wave opacity with slider state
       const wave = document.getElementById("zen-picker-lightness-wave");
       if (wave) {
-        // User requested track and base of sine wave to remain same opacity
-        // We only hide fill and thumb via CSS if [disabled="true"]
         wave.style.opacity = "1";
       }
     }
 
-    // Thumb size
     const h = 40 + opacity * 15;
     const w = 10 + opacity * 15;
     slider.style.setProperty("--zen-thumb-height", `${h}px`);
     slider.style.setProperty("--zen-thumb-width", `${w}px`);
   }
 
-  /**
-   * Fast Projector: Directly updates dot colors and background CSS
-   * without triggering heavy native reconciliation.
-   */
   fastProjectLightness(lightness) {
     const picker = this.picker;
     const docElem = document.documentElement;
@@ -2457,13 +2425,13 @@ class PaletteModule {
       "";
 
     const padding = 30;
+    // dotHalfSize = 29 per current Zen source
     const dotHalfSize = 29;
     let width;
     let height;
 
     if (panel) {
       const rect = panel.getBoundingClientRect();
-      // Hidden panel can report near-zero dimensions; use stable fallback geometry.
       if (rect.width > 10 && rect.height > 10) {
         width = rect.width + padding * 2;
         height = rect.height + padding * 2;
@@ -2471,7 +2439,6 @@ class PaletteModule {
     }
 
     if (!width || !height) {
-      // Zen's native baseline picker size used before render.
       const base = 380;
       width = base + padding * 2;
       height = base + padding * 2;
@@ -2481,10 +2448,8 @@ class PaletteModule {
       cy = height / 2;
     const radius = (width - padding) / 2;
 
-    // 0. Sync Private State (Lightweight)
     this.forceNativeLightness(lightness);
 
-    // 1. Update Dot Visuals (Calculate Hue & Saturation from Position)
     const updatedColors = picker.dots.map((dot) => {
       const x = dot.position.x + dotHalfSize;
       const y = dot.position.y + dotHalfSize;
@@ -2494,7 +2459,6 @@ class PaletteModule {
       const normalizedDistance = 1 - Math.min(distance / radius, 1);
 
       const h = ((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
-      // Exact parity with Zen's getColorFromPosition
       const isExplicitLightness = dot.type === "explicit-lightness";
       let s = normalizedDistance * 100;
       if (!isExplicitLightness) {
@@ -2504,7 +2468,6 @@ class PaletteModule {
 
       let l = lightness;
       if (!isExplicitLightness) {
-        // Parity with Zen: Center is dark (0), Edge is light (100)
         l = (1 - normalizedDistance) * 100;
       }
 
@@ -2525,7 +2488,6 @@ class PaletteModule {
       };
     });
 
-    // 2. Update Background Visuals
     const gradient = picker.getGradient(updatedColors);
     const toolbarGradient = picker.getGradient(updatedColors, true);
 
@@ -2535,13 +2497,11 @@ class PaletteModule {
       toolbarGradient,
     );
 
-    // 3. Update Primary/Accent UI Color
     const dominant = picker.getMostDominantColor(updatedColors);
     if (dominant) {
       const primary = picker.getAccentColorForUI(dominant);
       docElem.style.setProperty("--zen-primary-color", primary);
 
-      // 4. Update Text Contrast (Text Color)
       try {
         const isDarkMode = picker.shouldBeDarkMode(dominant);
         docElem.setAttribute("zen-should-be-dark-mode", isDarkMode);
@@ -2556,13 +2516,11 @@ class PaletteModule {
       }
     }
 
-    // 4. Persistence Fix: Update native theme object to prevent reset during dot dragging
     const ws = picker.currentWorkspace;
     if (ws?.theme) {
       ws.theme.lightness = lightness;
     }
 
-    // 5. Dynamic Theme Switching (Hook)
     if (this.dynamicThemeMod) {
       this.dynamicThemeMod.checkAndApplyTheme(updatedColors, picker);
     }
@@ -2589,12 +2547,9 @@ class DynamicThemeModule {
   }
 
   init(picker) {
-    // Expose ourselves to PaletteModule for the hook
     if (ZenPickerMods.paletteMod) {
       ZenPickerMods.paletteMod.dynamicThemeMod = this;
     } else {
-      // Fallback if init order is swapped (though PaletteMod is pushed before in main list)
-      // Just wait a tick or check main array
       const pm = ZenPickerMods.modules.find((m) => m instanceof PaletteModule);
       if (pm) pm.dynamicThemeMod = this;
     }
@@ -2627,32 +2582,21 @@ class DynamicThemeModule {
     );
     Services.prefs.addObserver("zen.view.window.scheme", this._prefObserver);
 
-    // System theme listener
     const mql = window.matchMedia("(prefers-color-scheme: dark)");
     this._sysListener = () => {
       if (!self._inversionEnabled) {
-        // If inversion is off, just trigger a normal workspace sync to match text colors etc
         if (self._textLockEnabled && picker.updateCurrentWorkspace) {
           picker.updateCurrentWorkspace();
         }
         return;
       }
 
-      // --- Robust Inversion Sequence for OS Theme Changes ---
-
-      // 1. Primary Inversion + Hard Refresh (500ms)
-      // This is the main fix for the "grey-out" bug. We wait for OS to settle,
-      // then force Zen to re-map colors based on the NEW OS scheme.
       setTimeout(() => {
         self.checkAndApplyInversion(picker, false, true);
       }, 500);
 
-      // 2. Safety Refresh (1000ms)
-      // Ensures any final UI artifacts are cleaned up and the workspace is saved.
       setTimeout(() => {
         if (!picker.updateCurrentWorkspace) return;
-        // If we just applied a closed-panel per-dot inversion, a follow-up
-        // rebuild can replay stale workspace theme data and undo the flip.
         const now = Date.now();
         const hadRecentClosedPerDotInversion =
           now - (self._lastClosedPerDotInversionAt || 0) < 1400;
@@ -2663,7 +2607,6 @@ class DynamicThemeModule {
     };
     mql.addEventListener("change", this._sysListener);
 
-    // Cleanup on window unload (optional but good practice for uc.js)
     window.addEventListener(
       "unload",
       () => {
@@ -2696,10 +2639,8 @@ class DynamicThemeModule {
   patchPicker(picker) {
     const self = this;
 
-    // 0. Patch shouldBeDarkMode (Covers text contrast logic)
     const origShouldBeDark = picker.shouldBeDarkMode.bind(picker);
     picker.shouldBeDarkMode = function (accentColor) {
-      // Re-read for responsiveness
       try {
         self._textLockEnabled = Services.prefs.getBoolPref(
           DynamicThemeModule.TEXT_LOCK_PREF,
@@ -2713,24 +2654,17 @@ class DynamicThemeModule {
       return origShouldBeDark(accentColor);
     };
 
-    // 1. Patch updateCurrentWorkspace (Covers palette changes, dot changes, native presets)
     const origUpdate = picker.updateCurrentWorkspace.bind(picker);
     picker.updateCurrentWorkspace = function (...args) {
-      // Check and enforce inversion BEFORE saving or syncing
-      // Skip for per-dot palettes (Full/B&W) to avoid re-entry that compounds
-      // the inversion and destroys per-dot color variation.
       if (self._inversionEnabled && !self._isInverting) {
         if (self._isDotDragInProgress(this)) {
-          // Never invert while the user is actively dragging palette dots.
-          // This prevents jitter and unintended palette flips mid-drag.
           self._schedulePostDragInversion(this);
           return origUpdate.apply(this, args);
         }
         const firstDot = this.dots?.[0];
-        // Full palettes may carry type as undefined or the string "undefined" after DOM serialization.
         const isPerDot = firstDot && firstDot.type !== "explicit-lightness";
         if (!isPerDot) {
-          self.checkAndApplyInversion(this, true); // true = silent, don't re-trigger update
+          self.checkAndApplyInversion(this, true);
         }
       }
 
@@ -2746,7 +2680,6 @@ class DynamicThemeModule {
       return res;
     };
 
-    // 2. Patch onWorkspaceChange (Covers workspace switching, favorites restoration)
     const origOnWsChange = picker.onWorkspaceChange.bind(picker);
     picker.onWorkspaceChange = function (...args) {
       const res = origOnWsChange.apply(this, args);
@@ -2803,8 +2736,6 @@ class DynamicThemeModule {
   }
 
   _isDotDragInProgress(picker) {
-    // Native picker sets `dragging` during dot drag and `recentlyDragged`
-    // briefly after mouseup to avoid click/drag race effects.
     return Boolean(
       picker?.dragging || picker?.draggedDot || picker?.recentlyDragged,
     );
@@ -2822,6 +2753,7 @@ class DynamicThemeModule {
       this.checkAndApplyInversion(picker, false, false);
     }, 180);
   }
+
   _getPickerGeometry(picker) {
     const padding = 30;
     const dotHalfSize = 29;
@@ -2849,7 +2781,6 @@ class DynamicThemeModule {
       return this._lastPickerGeometry;
     }
 
-    // Fallback to Zen's native baseline picker size when panel is hidden/unmeasurable.
     const base = 380;
     const width = base + padding * 2;
     const height = base + padding * 2;
@@ -2909,7 +2840,6 @@ class DynamicThemeModule {
           hue = Number.isFinite(hsl[0]) ? hsl[0] : 0;
           saturation = Number.isFinite(hsl[1]) ? hsl[1] : 0;
         } else {
-          // Last fallback: geometry derivation if we couldn't read prior color either.
           const { radius, cx, cy, dotHalfSize } =
             this._getPickerGeometry(picker);
           const x = dot.position.x + dotHalfSize;
@@ -2997,8 +2927,6 @@ class DynamicThemeModule {
         const box = target?.closest?.("box[data-position]");
         if (!box || box.classList.contains("zen-picker-favorite-box")) return;
 
-        // Temporarily normalize click payload for the selected preset only.
-        // This keeps preset preview boxes visually untouched.
         const prevType = box.getAttribute("data-type");
         const prevLightness = box.getAttribute("data-lightness");
         const presetAutoInverted = this._normalizePresetBoxForInversion(
@@ -3058,16 +2986,9 @@ class DynamicThemeModule {
         shouldInvert =
           (isDark && baseLightness > 50) || (!isDark && baseLightness < 50);
       } else if (isBW) {
-        // B&W presets in Zen usually have a data-lightness if they are solid,
-        // or we check the average dot position. Since we are inside a preset box click,
-        // we can check if it has a lightness. If not, we assume based on ID or index,
-        // but easier to check the attribute.
         if (Number.isFinite(baseLightness)) {
           shouldInvert =
             (isDark && baseLightness > 50) || (!isDark && baseLightness < 50);
-        } else {
-          // Fallback: If no lightness is set, check if the box has "White" or "Black" in its style/id if possible,
-          // but usually Zen sets d-lightness. If not, we skip.
         }
       }
     }
@@ -3085,7 +3006,7 @@ class DynamicThemeModule {
   }
 
   _refreshNativePresetBoxes(picker) {
-    // Intentionally no-op: we do not mutate preset preview boxes.
+    // Intentionally no-op
   }
 
   _showInversionToast() {
@@ -3118,7 +3039,6 @@ class DynamicThemeModule {
     };
 
     const computedDots = picker.dots.map((dot) => {
-      // If 'c' exists and looks valid, use it
       if (dot.c && Array.isArray(dot.c) && dot.c.length === 3) return dot;
 
       const x = dot.position.x + dotHalfSize;
@@ -3137,7 +3057,6 @@ class DynamicThemeModule {
       }
       if (dot.type === "explicit-black-white") s = 0;
 
-      // Lightness derivation
       let l;
       if (!isExplicitLightness) {
         l = (1 - normDist) * 100;
@@ -3160,16 +3079,11 @@ class DynamicThemeModule {
   }
 
   checkAndApplyTheme(colors, picker) {
-    // 1. Refresh Pref (Fast read)
     try {
       if (!Services.prefs.getBoolPref(DynamicThemeModule.PREF, false)) return;
     } catch (e) {
       return;
     }
-
-    // 2. Determine "Should be Dark Mode"
-    // picker.shouldBeDarkMode(color) returns true if the background is DARK (requiring light text)
-    // Therefore, we want the browser theme to be DARK (1) if shouldBeDarkMode is TRUE.
 
     try {
       const dominant = picker.getMostDominantColor(colors);
@@ -3177,52 +3091,29 @@ class DynamicThemeModule {
 
       const shouldBeDark = picker.shouldBeDarkMode(dominant);
 
-      // 3. Check Current System State to avoid redundant "sets"
-      // Note: We can't easily read "ui.systemUsesDarkTheme" directly as a property trust-ably if it's set to "0" (auto).
-      // But we can check our last applied state or just set it if different.
-
       if (this._lastIsDark === shouldBeDark) return;
 
-      // 4. Apply
       this._lastIsDark = shouldBeDark;
-      // 1 = Dark, 0 = Light (actually 0 is auto/light, usually 0 forces light if 1 is dark in older Gecko,
-      // but in Zen/Gecko, ui.systemUsesDarkTheme: 1 is Dark, 0 is Light.
-      // Wait, let's verify. usually checking standard user.js:
-      // ui.systemUsesDarkTheme = 1 (Dark)
-      // ui.systemUsesDarkTheme = 0 (Light)
-
-      // Actually, let's be safer:
-      // If shouldBeDark is true -> We want DARK theme -> Set 1
-      // If shouldBeDark is false -> We want LIGHT theme -> Set 0
-
       Services.prefs.setIntPref("ui.systemUsesDarkTheme", shouldBeDark ? 1 : 0);
-    } catch (e) {
-      // calculated color might be invalid during drag transition
-    }
+    } catch (e) {}
   }
 
   checkAndApplyInversion(picker, silent = false, forceHardRefresh = false) {
     if (!this._inversionEnabled || !picker.dots || !picker.dots.length) return;
     if (this._isDotDragInProgress(picker)) return;
-
-    // Prevent recursive loop if we are already inverting
     if (this._isInverting) return;
 
-    // Use direct OS detection if forceHardRefresh is true (during OS theme switch)
     const isDark = forceHardRefresh
       ? window.matchMedia("(prefers-color-scheme: dark)").matches
       : picker.isDarkMode;
 
     const firstDot = picker.dots[0];
-    // Full palettes may carry type as undefined or "undefined"; both are per-dot.
     const isPerDotPalette = firstDot.type !== "explicit-lightness";
     const surfaceReady = this._isPickerSurfaceReady(picker);
 
-    // Geometry (open panel if available, otherwise cached/fallback geometry).
     const geom = this._getPickerGeometry(picker);
     const { radius, cx, cy, dotHalfSize } = geom;
 
-    // Determine current lightness (average if per-dot, or scalar)
     let currentL;
     if (isPerDotPalette) {
       const avgDist =
@@ -3242,7 +3133,6 @@ class DynamicThemeModule {
           : 50;
     }
 
-    // Dark theme requires dark gradients (val <= 50). Light theme requires light gradients (val >= 50)
     const needsInversion =
       (isDark && currentL > 50) || (!isDark && currentL < 50);
 
@@ -3254,7 +3144,6 @@ class DynamicThemeModule {
 
         if (needsInversion) {
           if (isPerDotPalette) {
-            // RADIAL FLIP: Move dots between center (dark) and edge (light)
             picker.dots.forEach((d) => {
               const x = d.position.x + dotHalfSize;
               const y = d.position.y + dotHalfSize;
@@ -3263,7 +3152,6 @@ class DynamicThemeModule {
               const dist = Math.sqrt(dx * dx + dy * dy);
               const angle = Math.atan2(dy, dx);
 
-              // Invert distance: D' = Radius - D (clamped)
               const newDist = Math.max(0, Math.min(radius, radius - dist));
 
               newPositions.push({
@@ -3275,11 +3163,9 @@ class DynamicThemeModule {
                 type: d.type,
               });
 
-              // Let the projector/native logic handle the new per-dot lightness
               delete d.lightness;
             });
           } else {
-            // SCALAR INVERSION: Mirror fixed lightness
             scalarNewL = 100 - currentL;
             picker.dots.forEach((d) => {
               d.lightness = scalarNewL;
@@ -3290,14 +3176,12 @@ class DynamicThemeModule {
         const finalL =
           isPerDotPalette && needsInversion ? 100 - currentL : scalarNewL;
 
-        // Sync UI Components
         const slider = document.getElementById("zen-picker-lightness-slider");
         if (slider) slider.value = finalL;
         if (ZenPickerMods.paletteMod)
           ZenPickerMods.paletteMod.updateLightnessVisuals(finalL);
 
         if (isPerDotPalette && needsInversion) {
-          // Apply flipped positions
           if (surfaceReady) {
             picker.handleColorPositions(newPositions, true);
           } else {
@@ -3322,10 +3206,6 @@ class DynamicThemeModule {
             });
           }
 
-          // Rebuild per-dot RGB from new positions so getGradient
-          // receives dots with correct per-dot colors.
-          // Without this, the native pipeline would stamp a single
-          // #currentLightness on all dots, producing solid white/black.
           picker.dots.forEach((d) => {
             const x = d.position.x + dotHalfSize;
             const y = d.position.y + dotHalfSize;
@@ -3341,8 +3221,6 @@ class DynamicThemeModule {
               s = 0;
               l = radialRatio * 100;
             } else {
-              // Full palette parity with native getColorFromPosition:
-              // saturation: 90 at center, 100 at edge.
               s = 90 + radialRatio * 10;
               l = radialRatio * 100;
             }
@@ -3356,7 +3234,6 @@ class DynamicThemeModule {
           });
 
           if (!surfaceReady) {
-            // Closed-panel path: apply gradients directly from recomputed dots.
             const currentAlgo =
               picker.useAlgo ||
               picker.currentWorkspace?.theme?.gradientColors?.[0]?.algorithm ||
@@ -3394,8 +3271,6 @@ class DynamicThemeModule {
               } catch (e) {}
             }
 
-            // Persist the per-dot inversion so any delayed refresh uses
-            // the new (already inverted) state instead of stale theme data.
             const ws = picker.currentWorkspace;
             this._lastClosedPerDotInversionAt = Date.now();
             if (ws?.theme) {
@@ -3423,7 +3298,6 @@ class DynamicThemeModule {
             }
           }
         } else if (!isPerDotPalette && needsInversion) {
-          // Normal Scalar Path
           if (!surfaceReady) {
             this._projectScalarLightnessClosed(picker, scalarNewL);
           } else if (ZenPickerMods.paletteMod) {
@@ -3436,9 +3310,6 @@ class DynamicThemeModule {
         if (forceHardRefresh || needsInversion) {
           setTimeout(() => {
             if (isPerDotPalette && !surfaceReady) return;
-            // For per-dot palettes, use skipSave=true to avoid the
-            // destructive onWorkspaceChange path that destroys all
-            // dots and recreates them with a single scalar lightness.
             picker.updateCurrentWorkspace(isPerDotPalette);
           }, 50);
         }
@@ -3472,7 +3343,6 @@ class FavoritesModule {
   init(picker) {
     if (picker._favoritesModPatched) return;
     this.picker = picker;
-    // Load favorites from file (async, non-blocking)
     ZenPickerMods.FavoritesStorage.load().then(() => {
       this.refreshFavoritesUI();
       this.updateButtonState();
@@ -3494,7 +3364,6 @@ class FavoritesModule {
     btn.className = "subviewbutton";
     btn.setAttribute("tooltiptext", "Toggle Favorite");
 
-    // Prevent palette from stealing focus/clicks and dot-snapping
     ["mousedown", "click", "mouseup", "command"].forEach((type) => {
       btn.addEventListener(
         type,
@@ -3543,165 +3412,38 @@ class FavoritesModule {
                 z-index: 2;
                 pointer-events: none;
             }
-            #zen-picker-favorite-save:hover::before {
-                opacity: 1;
-            }
+            #zen-picker-favorite-save:hover::before { opacity: 1; }
             #zen-picker-favorite-save.is-favorite::before {
                 background: #f44336 !important;
                 mask: url("data:image/svg+xml,%3Csvg width='100%25' height='100%25' viewBox='0 0 24 24' fill='black' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M11.9932 5.13581C9.9938 2.7984 6.65975 2.16964 4.15469 4.31001C1.64964 6.45038 1.29697 10.029 3.2642 12.5604C4.89982 14.6651 9.84977 19.1041 11.4721 20.5408C11.6536 20.7016 11.7444 20.7819 11.8502 20.8135C11.9426 20.8411 12.0437 20.8411 12.1361 20.8135C12.2419 20.7819 12.3327 20.7016 12.5142 20.5408C14.1365 19.1041 19.0865 14.6651 20.7221 12.5604C22.6893 10.029 22.3797 6.42787 19.8316 4.31001C17.2835 2.19216 13.9925 2.7984 11.9932 5.13581Z'/%3E%3C/svg%3E") no-repeat center;
             }
-            
-            /* Favorites Pages & Grid */
-            .zen-picker-favorites-page {
-                justify-content: space-between;
-                min-width: 100%;
-                padding: 0 1px;
-            }
-            .zen-picker-favorite-box {
-                width: 26px;
-                height: 26px;
-                box-shadow: 0 0 1px 1px rgba(0, 0, 0, 0.1);
-                border-radius: 50%;
-                margin: 2px 0;
-                cursor: pointer;
-                position: relative;
-                transition: transform 0.1s;
-                overflow: visible !important;
-            }
-            .zen-picker-favorite-box:not(.is-ghost) {
-                cursor: grab;
-            }
-            #PanelUI-zen-gradient-generator-color-pages[dragging-favorite="true"] .zen-picker-favorite-box:not(.is-ghost):not([dragged="true"]) {
-                opacity: 0.62;
-                pointer-events: none;
-            }
-            .zen-picker-favorite-box.zen-dragging {
-                opacity: 0.45;
-                transform: scale(0.94) !important;
-                cursor: grabbing !important;
-            }
-            .zen-picker-favorite-box[dragged="true"] {
-                position: fixed !important;
-                z-index: 2147483647 !important;
-                pointer-events: none !important;
-                transform: none !important;
-                transform-origin: top left !important;
-                box-shadow: 0 10px 22px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(255,255,255,0.25);
-                transition: none !important;
-                margin: 0 !important;
-            }
-            .zen-picker-favorite-box.zen-drop-target {
-                outline: none !important;
-                transform: none !important;
-            }
-            .zen-picker-favorite-box:not([dragged="true"]):hover {
-                transform: scale(1.05);
-            }
-            .zen-picker-favorite-box:not([dragged="true"]):active {
-                transform: scale(0.95);
-            }
-            .zen-picker-favorite-box:after {
-                content: "";
-                position: absolute;
-                bottom: -2px;
-                right: -2px;
-                width: 12px;
-                height: 12px;
-                background: #f44336;
-                mask: url("data:image/svg+xml,%3Csvg width='100%25' height='100%25' viewBox='0 0 24 24' fill='black' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M11.9932 5.13581C9.9938 2.7984 6.65975 2.16964 4.15469 4.31001C1.64964 6.45038 1.29697 10.029 3.2642 12.5604C4.89982 14.6651 9.84977 19.1041 11.4721 20.5408C11.6536 20.7016 11.7444 20.7819 11.8502 20.8135C11.9426 20.8411 12.0437 20.8411 12.1361 20.8135C12.2419 20.7819 12.3327 20.7016 12.5142 20.5408C14.1365 19.1041 19.0865 14.6651 20.7221 12.5604C22.6893 10.029 22.3797 6.42787 19.8316 4.31001C17.2835 2.19216 13.9925 2.7984 11.9932 5.13581Z'/%3E%3C/svg%3E") no-repeat center;
-                mask-size: contain;
-                pointer-events: none;
-                filter: drop-shadow(0 0 1px white);
-                z-index: 2;
-            }
-            .zen-picker-favorite-box[data-num-dots="2"] {
-                background: linear-gradient(135deg, var(--c1), var(--c2)) !important;
-            }
-            .zen-picker-favorite-box[data-num-dots="3"] {
-                background: radial-gradient(circle at 0% 0%, var(--c1), transparent 100%), 
-                            radial-gradient(circle at 100% 0%, var(--c2), transparent 100%),
-                            linear-gradient(to top, var(--c3) 0%, transparent 60%) !important;
-            }
-            .zen-picker-favorite-box[data-num-dots="4"] {
-                background: radial-gradient(circle at 0% 0%, var(--c1), transparent 70%),
-                            radial-gradient(circle at 100% 0%, var(--c2), transparent 70%),
-                            radial-gradient(circle at 0% 100%, var(--c3), transparent 70%),
-                            linear-gradient(-45deg, var(--c4) 0%, transparent 100%) !important;
-            }
-            .zen-picker-favorite-box[data-num-dots="5"] {
-                background: radial-gradient(circle at 0% 0%, var(--c1), transparent 60%),
-                            radial-gradient(circle at 100% 0%, var(--c2), transparent 60%),
-                            radial-gradient(circle at 0% 100%, var(--c3), transparent 60%),
-                            radial-gradient(circle at 100% 100%, var(--c4), transparent 60%),
-                            linear-gradient(-45deg, var(--c5) 0%, transparent 100%) !important;
-            }
-            .zen-picker-favorite-box[data-num-dots="6"] {
-                background: radial-gradient(circle at 0% 0%, var(--c1), transparent 60%),
-                            radial-gradient(circle at 100% 0%, var(--c2), transparent 60%),
-                            radial-gradient(circle at 0% 100%, var(--c3), transparent 60%),
-                            radial-gradient(circle at 50% 100%, var(--c4), transparent 60%),
-                            radial-gradient(circle at 100% 100%, var(--c5), transparent 60%),
-                            linear-gradient(-45deg, var(--c6) 0%, transparent 100%) !important;
-            }
-
-            .zen-picker-favorite-box.is-ghost {
-                background: light-dark(rgba(0,0,0,0.03), rgba(255,255,255,0.05)) !important;
-                border: 1px dashed light-dark(rgba(0,0,0,0.1), rgba(255,255,255,0.15)) !important;
-                box-shadow: none !important;
-                pointer-events: auto !important;
-                cursor: default !important;
-            }
-            .zen-picker-favorite-box.zen-favorite-placeholder {
-                background: light-dark(rgba(0,0,0,0.03), rgba(255,255,255,0.05)) !important;
-                border: 1px dashed light-dark(rgba(0,0,0,0.22), rgba(255,255,255,0.30)) !important;
-                box-shadow: none !important;
-                opacity: 1 !important;
-                pointer-events: none !important;
-            }
-            .zen-picker-favorite-box.zen-favorite-placeholder.entering {
-                animation: zen-favorite-slot-pop 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
-            }
-            @keyframes zen-favorite-slot-pop {
-                0% { transform: scale(0.86); opacity: 0.25; }
-                100% { transform: scale(1); opacity: 1; }
-            }
-            .zen-picker-favorite-box.is-ghost::before { display: none !important; }
-            .zen-picker-favorite-box.is-ghost:after { display: none !important; }
-            .zen-picker-favorite-box.zen-favorite-placeholder::before { display: none !important; }
-            .zen-picker-favorite-box.zen-favorite-placeholder:after { display: none !important; }
-
-            /* Heart Transition */
-            .zen-picker-favorite-heart {
-                transition: fill 0.6s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.6s ease;
-                opacity: 0.5;
-            }
-            .zen-picker-favorite-heart[active="true"] {
-                fill: #ef4444 !important;
-                opacity: 1;
-            }
-            
-            /* Box overlay heart */
-            .zen-picker-favorite-box .zen-picker-favorite-heart[active="true"] {
-                fill: white !important;
-                opacity: 0.9;
-            }
-            
-            /* Favorite Pop-in Animation */
-            .zen-favorite-pop-in {
-                animation: zen-favorite-pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
-            }
-            @keyframes zen-favorite-pop {
-                0% { transform: scale(0.6); opacity: 0; }
-                100% { transform: scale(1); opacity: 1; }
-            }
-
-            /* Restoration Transitions (Bug 3) */
-            #PanelUI-zen-gradient-generator.zen-favorites-restoring #PanelUI-zen-gradient-generator-opacity {
-                transition: --zen-thumb-height 0.4s ease, --zen-thumb-width 0.4s ease !important;
-            }
-            #PanelUI-zen-gradient-generator.zen-favorites-restoring #PanelUI-zen-gradient-slider-wave path {
-                transition: d 0.4s cubic-bezier(0.4, 0, 0.2, 1), stroke 0.4s ease !important;
-            }
+            .zen-picker-favorites-page { justify-content: space-between; min-width: 100%; padding: 0 1px; }
+            .zen-picker-favorite-box { width: 26px; height: 26px; box-shadow: 0 0 1px 1px rgba(0, 0, 0, 0.1); border-radius: 50%; margin: 2px 0; cursor: pointer; position: relative; transition: transform 0.1s; overflow: visible !important; }
+            .zen-picker-favorite-box:not(.is-ghost) { cursor: grab; }
+            #PanelUI-zen-gradient-generator-color-pages[dragging-favorite="true"] .zen-picker-favorite-box:not(.is-ghost):not([dragged="true"]) { opacity: 0.62; pointer-events: none; }
+            .zen-picker-favorite-box.zen-dragging { opacity: 0.45; transform: scale(0.94) !important; cursor: grabbing !important; }
+            .zen-picker-favorite-box[dragged="true"] { position: fixed !important; z-index: 2147483647 !important; pointer-events: none !important; transform: none !important; transform-origin: top left !important; box-shadow: 0 10px 22px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(255,255,255,0.25); transition: none !important; margin: 0 !important; }
+            .zen-picker-favorite-box.zen-drop-target { outline: none !important; transform: none !important; }
+            .zen-picker-favorite-box.zen-favorite-placeholder { background: light-dark(rgba(0,0,0,0.03), rgba(255,255,255,0.05)) !important; border: 1px dashed light-dark(rgba(0,0,0,0.22), rgba(255,255,255,0.30)) !important; box-shadow: none !important; opacity: 1 !important; pointer-events: none !important; }
+            .zen-picker-favorite-box.zen-favorite-placeholder.entering { animation: zen-favorite-slot-pop 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
+            @keyframes zen-favorite-slot-pop { 0% { transform: scale(0.86); opacity: 0.25; } 100% { transform: scale(1); opacity: 1; } }
+            .zen-picker-favorite-box:not([dragged="true"]):hover { transform: scale(1.05); }
+            .zen-picker-favorite-box:not([dragged="true"]):active { transform: scale(0.95); }
+            .zen-picker-favorite-box:after { content: ""; position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; background: #f44336; mask: url("data:image/svg+xml,%3Csvg width='100%25' height='100%25' viewBox='0 0 24 24' fill='black' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M11.9932 5.13581C9.9938 2.7984 6.65975 2.16964 4.15469 4.31001C1.64964 6.45038 1.29697 10.029 3.2642 12.5604C4.89982 14.6651 9.84977 19.1041 11.4721 20.5408C11.6536 20.7016 11.7444 20.7819 11.8502 20.8135C11.9426 20.8411 12.0437 20.8411 12.1361 20.8135C12.2419 20.7819 12.3327 20.7016 12.5142 20.5408C14.1365 19.1041 19.0865 14.6651 20.7221 12.5604C22.6893 10.029 22.3797 6.42787 19.8316 4.31001C17.2835 2.19216 13.9925 2.7984 11.9932 5.13581Z'/%3E%3C/svg%3E") no-repeat center; mask-size: contain; pointer-events: none; filter: drop-shadow(0 0 1px white); z-index: 2; }
+            .zen-picker-favorite-box[data-num-dots="2"] { background: linear-gradient(135deg, var(--c1), var(--c2)) !important; }
+            .zen-picker-favorite-box[data-num-dots="3"] { background: radial-gradient(circle at 0% 0%, var(--c1), transparent 100%), radial-gradient(circle at 100% 0%, var(--c2), transparent 100%), linear-gradient(to top, var(--c3) 0%, transparent 60%) !important; }
+            .zen-picker-favorite-box[data-num-dots="4"] { background: radial-gradient(circle at 0% 0%, var(--c1), transparent 70%), radial-gradient(circle at 100% 0%, var(--c2), transparent 70%), radial-gradient(circle at 0% 100%, var(--c3), transparent 70%), linear-gradient(-45deg, var(--c4) 0%, transparent 100%) !important; }
+            .zen-picker-favorite-box[data-num-dots="5"] { background: radial-gradient(circle at 0% 0%, var(--c1), transparent 60%), radial-gradient(circle at 100% 0%, var(--c2), transparent 60%), radial-gradient(circle at 0% 100%, var(--c3), transparent 60%), radial-gradient(circle at 100% 100%, var(--c4), transparent 60%), linear-gradient(-45deg, var(--c5) 0%, transparent 100%) !important; }
+            .zen-picker-favorite-box[data-num-dots="6"] { background: radial-gradient(circle at 0% 0%, var(--c1), transparent 60%), radial-gradient(circle at 100% 0%, var(--c2), transparent 60%), radial-gradient(circle at 0% 100%, var(--c3), transparent 60%), radial-gradient(circle at 50% 100%, var(--c4), transparent 60%), radial-gradient(circle at 100% 100%, var(--c5), transparent 60%), linear-gradient(-45deg, var(--c6) 0%, transparent 100%) !important; }
+            .zen-picker-favorite-box.is-ghost { background: light-dark(rgba(0,0,0,0.03), rgba(255,255,255,0.05)) !important; border: 1px dashed light-dark(rgba(0,0,0,0.1), rgba(255,255,255,0.15)) !important; box-shadow: none !important; pointer-events: auto !important; cursor: default !important; }
+            .zen-picker-favorite-box.is-ghost::before, .zen-picker-favorite-box.is-ghost:after, .zen-picker-favorite-box.zen-favorite-placeholder::before, .zen-picker-favorite-box.zen-favorite-placeholder:after { display: none !important; }
+            .zen-picker-favorite-heart { transition: fill 0.6s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.6s ease; opacity: 0.5; }
+            .zen-picker-favorite-heart[active="true"] { fill: #ef4444 !important; opacity: 1; }
+            .zen-picker-favorite-box .zen-picker-favorite-heart[active="true"] { fill: white !important; opacity: 0.9; }
+            .zen-favorite-pop-in { animation: zen-favorite-pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+            @keyframes zen-favorite-pop { 0% { transform: scale(0.6); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+            #PanelUI-zen-gradient-generator.zen-favorites-restoring #PanelUI-zen-gradient-generator-opacity { transition: --zen-thumb-height 0.4s ease, --zen-thumb-width 0.4s ease !important; }
+            #PanelUI-zen-gradient-generator.zen-favorites-restoring #PanelUI-zen-gradient-slider-wave path { transition: d 0.4s cubic-bezier(0.4, 0, 0.2, 1), stroke 0.4s ease !important; }
         `;
   }
 
@@ -3978,7 +3720,7 @@ class FavoritesModule {
       algo: picker.dots.length === 1 ? "floating" : picker.useAlgo || "",
       lightness: picker.dots[0].lightness || 50,
       numDots: picker.dots.length,
-      paletteType: picker.dots[0].type, // Preserving undefined allows 'Full Palette' logic
+      paletteType: picker.dots[0].type,
       opacity: picker.currentOpacity,
       texture: picker.currentTexture || 0,
       rotation:
@@ -3996,7 +3738,6 @@ class FavoritesModule {
   _isSame(f1, f2) {
     if (!f1 || !f2) return false;
 
-    // Type-safe normalization (handling string vs number issues)
     const n1 = {
       numDots: Number(f1.numDots),
       algo: f1.numDots === 1 ? "floating" : String(f1.algo),
@@ -4050,12 +3791,10 @@ class FavoritesModule {
     let toastMsg = "";
 
     if (existingIndex > -1) {
-      // Remove
       favs.splice(existingIndex, 1);
       toastMsg = "Gradient removed successfully!";
     } else {
-      // Add
-      current._isNew = true; // Mark for pop-in animation
+      current._isNew = true;
       favs.unshift(current);
       toastMsg = "Gradient saved successfully!";
     }
@@ -4112,7 +3851,6 @@ class FavoritesModule {
       window.addEventListener("mouseup", up);
     });
 
-    // Opacity Reset - Center-click resets texture to 0 (matches reference implementation)
     if (textureWrapper) {
       if (!document.getElementById("zen-grain-reset-label")) {
         const label = document.createElement("div");
@@ -4142,13 +3880,11 @@ class FavoritesModule {
         )
           return;
 
-        // Reset texture to 0 using animateState for consistency
         this._animateState(picker.currentOpacity, 0);
         self.updateButtonState();
       });
     }
 
-    // Listen for preset clicks too
     document
       .getElementById("PanelUI-zen-gradient-generator-color-pages")
       ?.addEventListener(
@@ -4157,7 +3893,6 @@ class FavoritesModule {
         true,
       );
 
-    // Patch Zen's pagination to handle extra pages
     const pagesWrapper = document.getElementById(
       "PanelUI-zen-gradient-generator-color-pages",
     );
@@ -4169,14 +3904,12 @@ class FavoritesModule {
     );
 
     if (pagesWrapper && leftBtn && rightBtn) {
-      // Force a re-init of pagination logic to account for new children length
       const getPaginationModel = () => {
         const width = Math.max(1, pagesWrapper.offsetWidth || 1);
         const allPages = Array.from(pagesWrapper.children);
         const isDraggingFavorites =
           pagesWrapper.getAttribute("dragging-favorite") === "true";
 
-        // Only lock paging to favorites while an active reorder drag is running.
         if (!isDraggingFavorites) {
           return {
             width,
@@ -4212,7 +3945,6 @@ class FavoritesModule {
       this._updateFavoritePagination = updatePagBtns;
       pagesWrapper.addEventListener("scroll", updatePagBtns);
 
-      // Patch Buttons to work with ACTUAL child indices
       leftBtn.addEventListener(
         "click",
         (e) => {
@@ -4239,7 +3971,6 @@ class FavoritesModule {
         true,
       );
 
-      // Initial Favorites Load
       this.refreshFavoritesUI();
     }
 
@@ -4278,7 +4009,6 @@ class FavoritesModule {
   }
 
   _getPreviewColor(x, y, type, lightnessVal) {
-    // Safe HSL to RGB without side-effects on picker state
     const padding = 30,
       dotHalfSize = 29;
     const rect = { width: 380 + padding * 2, height: 380 + padding * 2 };
@@ -4299,7 +4029,6 @@ class FavoritesModule {
       s = normDist;
       l = lightnessVal / 100;
     } else {
-      // Dynamic lightness based on distance (Vibrant/Dark modes)
       s = 0.9 + (1 - normDist) * 0.1;
       l = 1 - normDist;
     }
@@ -4346,7 +4075,6 @@ class FavoritesModule {
       "PanelUI-zen-gradient-generator-color-page-right",
     );
 
-    // Cleanup old favorite pages
     Array.from(
       pagesWrapper.querySelectorAll(".zen-picker-favorites-page"),
     ).forEach((p) => p.remove());
@@ -4481,7 +4209,6 @@ class FavoritesModule {
             this._setDragClickSuppression();
 
             const rect = box.getBoundingClientRect();
-            // Keep ghost visually attached to cursor (centered).
             initialOffsetX = Math.round(rect.width / 2);
             initialOffsetY = Math.round(rect.height / 2);
             targetX = originEvent.clientX - initialOffsetX;
@@ -4594,7 +4321,6 @@ class FavoritesModule {
       if (!isGhost && fav._isNew) {
         box.classList.add("zen-favorite-pop-in");
         delete fav._isNew;
-        // Clean markers from cache and schedule save
         const favs = this._getFavs();
         favs.forEach((f) => delete f._isNew);
         this._saveFavs(favs);
@@ -4639,14 +4365,11 @@ class FavoritesModule {
 
     const step = (now) => {
       const p = Math.min(1, (now - start) / duration);
-      const ease = 1 - Math.pow(1 - p, 4); // easeOutQuart for smoother finish
+      const ease = 1 - Math.pow(1 - p, 4);
 
       picker.currentOpacity = fromOp + (toOp - fromOp) * ease;
-
-      // Linear interpolation (prevents wrapping around for knob logic)
       picker.currentTexture = fromTex + (toTex - fromTex) * ease;
 
-      // Sync UI only
       picker.updateCurrentWorkspace(true);
       if (p < 1) requestAnimationFrame(step);
     };
@@ -4658,11 +4381,9 @@ class FavoritesModule {
     const ws = gZenWorkspaces.getActiveWorkspace();
     if (!ws || !picker) return;
 
-    // 1. Establish Palette Context IMMEDIATELY (Shielded)
     if (picker._paletteMod) {
       picker._paletteMod._internalUpdate = true;
 
-      // Map saved type/lightness back to a known mode
       const modeIdx = PaletteModule.MODES.findIndex(
         (m) =>
           m.type === fav.paletteType &&
@@ -4672,14 +4393,11 @@ class FavoritesModule {
       picker._paletteMod._selectedMode =
         modeIdx > -1 ? PaletteModule.MODES[modeIdx] : null;
 
-      // Sync Zen's internal state early to influence native color calculations
       picker._paletteMod.forceNativeLightness(fav.lightness);
     }
 
-    // Trigger Transitions
     picker.panel.classList.add("zen-favorites-restoring");
 
-    // Force Dial UI State Restoration
     if (picker._rotationModule?.dialHandler) {
       picker._rotationModule.dialHandler.classList.add(
         "zen-programmatic-change",
@@ -4714,7 +4432,6 @@ class FavoritesModule {
     picker.getGradient(restoredTheme.gradientColors);
     picker.useAlgo = fav.algo;
 
-    // Harmony Sync
     if (fav.algo === "floating") {
       picker.panel.setAttribute("zen-harmony-mode", "floating");
       picker._floatingActive = true;
@@ -4730,7 +4447,6 @@ class FavoritesModule {
       picker._rotationModule.applyRotation();
     }
 
-    // Dot count adjustment (UI only)
     if (fav.numDots < picker.dots.length) {
       for (let i = fav.numDots; i < picker.dots.length; i++) {
         picker.dots[i].element?.remove();
@@ -4738,7 +4454,6 @@ class FavoritesModule {
       picker.dots = picker.dots.slice(0, fav.numDots);
     }
 
-    // Phase 2: Native Restoration
     const colorPositions = fav.dots.map((d) => ({
       ID: d.id,
       position: { x: d.x, y: d.y },
@@ -4747,9 +4462,6 @@ class FavoritesModule {
 
     picker.handleColorPositions(colorPositions, true);
 
-    // Face 3: Forced Visual Parity (Bypassing Zen internal lag/resets)
-    // ONLY force common lightness for explicit-lightness modes (Pastel, Dark, etc.)
-    // Full Palette and B&W must keep their individual saved lightness values.
     if (fav.paletteType === "explicit-lightness") {
       picker.dots.forEach((d) => {
         d.lightness = fav.lightness;
@@ -4762,7 +4474,6 @@ class FavoritesModule {
     picker.onWorkspaceChange(ws, true, ws.theme);
     gZenWorkspaces.saveWorkspace(ws);
 
-    // Delay checking the favorite state to allow for dot population
     setTimeout(() => this.updateButtonState(), 250);
 
     setTimeout(() => {
